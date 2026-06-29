@@ -14,6 +14,9 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
+import ast
+import pandas as pd
+
 # --- CONSTANTS ---
 # INPUT_PATH  = "listings.csv"
 # OUTPUT_PATH = "results.csv"
@@ -22,6 +25,14 @@
 #     "id", "summary", "detailedDescription", "keyFeatures",
 #     "propertySubType", "useClass", "tenureType", "pageTitle"
 # ]
+
+INPUT_PATH = "listings.csv"
+OUTPUT_PATH = "results.csv"
+MODEL = "gpt-4o-mini"
+SIGNAL_FIELDS = [
+    "id", "summary", "detailedDescription", "keyFeatures",
+    "propertySubType", "useClass", "tenureType", "pageTitle"
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,12 +43,20 @@
 #   OUTPUT:  raw dataframe, all 70 columns, all 23 rows
 #   HANDLES: file not found, encoding errors
 
+def load_csv(filepath: str) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(filepath, dtype=str)
+        print(f"Loaded {len(df)} listings from {filepath}")
+        return df
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Could not find listings file: {filepath}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # extract_signal_fields(row: pd.Series) -> dict
 #
 #   PURPOSE: Extract only the fields with classification signal from a raw row.
-#            Most columns are empty for most rows — this filters the noise.
+#            Most columns are empty for most rows - this filters the noise.
 #   INPUT:   single dataframe row
 #   OUTPUT:  clean dict, e.g.:
 #            {
@@ -55,6 +74,44 @@
 #     - keyFeatures is a stringified Python list -> ast.literal_eval()
 #       with try/except fallback to raw string if malformed
 #     - numeric IDs (e.g. 89924760.0) -> cast to string, strip ".0"
+
+def parse_key_features(raw: str) -> list[str]:
+    # keyFeatures is a stringified Python list
+    # try ast.literal_eval first, fall back to raw string
+    try:
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+        return [str(parsed)]
+    except (ValueError, SyntaxError):
+        return [raw] if raw else []
+
+
+def normalise_id(raw_id: str) -> str:
+    # numeric IDs come through as "89924760.0" — strip the .0
+    try:
+        return str(int(float(raw_id)))
+    except (ValueError, TypeError):
+        return str(raw_id).strip()
+
+
+def extract_signal_fields(row: pd.Series) -> dict:
+    def get(field: str) -> str:
+        val = row.get(field, "")
+        if pd.isna(val) or str(val).strip() in ("", "nan"):
+            return ""
+        return str(val).strip()
+
+    return {
+        "id": normalise_id(get("id")),
+        "summary": get("summary"),
+        "detailedDescription": get("detailedDescription"),
+        "keyFeatures": parse_key_features(get("keyFeatures")),
+        "propertySubType": get("propertySubType"),
+        "useClass": get("useClass"),
+        "tenureType": get("tenureType"),
+        "pageTitle": get("pageTitle"),
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -122,8 +179,22 @@
 #            append result to results list
 #     3. write_results(results, raw_df, OUTPUT_PATH)
 #     4. print summary: N classified, breakdown by category
-#
+
+def main():
+    df = load_csv(INPUT_PATH)
+    listings = []
+    for _, row in df.iterrows():
+        listing = extract_signal_fields(row)
+        listings.append(listing)
+        print(f"ID: {listing['id']} | summary: {listing['summary'][:80]}")
+
+    print(f"\nExtracted {len(listings)} listings")
+    return listings
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # if __name__ == "__main__":
 #     main()
+
+if __name__ == "__main__":
+    main()
