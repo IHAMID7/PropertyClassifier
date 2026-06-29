@@ -15,7 +15,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import ast
+import csv
+import json
+import os
+
 import pandas as pd
+from dotenv import load_dotenv
+from openai import OpenAI
 
 # --- CONSTANTS ---
 # INPUT_PATH  = "listings.csv"
@@ -33,6 +39,9 @@ SIGNAL_FIELDS = [
     "id", "summary", "detailedDescription", "keyFeatures",
     "propertySubType", "useClass", "tenureType", "pageTitle"
 ]
+
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -116,18 +125,118 @@ def extract_signal_fields(row: pd.Series) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # build_prompt(listing: dict) -> str
-#   TO BE IMPLEMENTED - see future commit
+#
+#   PURPOSE: Build system prompt + listing data for LLM classification
+#   INPUT:   clean signal dict from extract_signal_fields()
+#   OUTPUT:  full prompt string (system instructions + formatted listing fields)
+
+def build_prompt(listing: dict) -> str:
+    system = """You are a property classification assistant for a UK property acquisition and development company called Harkalm Group.
+
+The company acquires and develops properties across three sectors only. Your job is to classify each listing into one of four categories based on the available listing data.
+
+CATEGORIES:
+
+NURSERY: Children's day care or early years education. Strong signals include:
+- Explicit mention of children's nursery, day care, or early years provision
+- D1, E(f), or F1 planning consent for childcare use
+- Age ranges for young children (0-5, birth to 5)
+- Ofsted registration or funded childcare places
+- Nursery-specific fixtures: low-level sinks, enclosed outdoor play areas, soft play
+- Vacant commercial buildings (former banks, offices) in residential catchments
+  with conversion potential may qualify even without current nursery use
+
+SEN SCHOOL: Special educational needs provision. Strong signals include:
+- Explicit mention of SEN, SEMH, alternative provision, or specialist school
+- F1 (formerly D1) planning consent for educational institution
+- Sensory rooms, therapy suites, or specialist teaching facilities
+- Local authority placements or pupil referrals mentioned
+- School-age children (5-18) in specialist or therapeutic settings
+
+FOOD STORE: Convenience or grocery retail specifically. Strong signals include:
+- Named grocery retailer (Co-op, Costcutter, Tesco, Sainsbury's, Aldi, Lidl etc.)
+- A1 or E use class with explicit food grocery retail context
+- Chiller cabinets, shelving runs, stockroom, rear servicing yard
+- Supermarket or convenience store explicitly named
+- Property size broadly 2,500 to 30,000 sq ft
+- IMPORTANT: Coffee shops, restaurants, bars, takeaways, and pubs are NOT
+  food stores for this company — classify these as None
+
+NONE: Use when:
+- The listing is residential, land, industrial, pub, or mixed-use with no clear
+  sector fit
+- Agent copy hedges with phrases like "suitable for alternative uses",
+  "variety of uses", or "may suit" without a prior sector-specific operator,
+  confirmed use class, or sector-specific fixtures to anchor the classification
+- There is insufficient signal to confidently assign any of the three sectors
+- The property is legally or structurally suited to a use outside the three
+  sectors above (e.g. healthcare, office, retail restaurant)
+
+CONFIDENCE RULES:
+High   — Sector-specific evidence is explicit and unambiguous: named operator,
+          confirmed planning consent for that use, sector fixtures present,
+          or property currently/recently operating in that sector
+Medium — Prior use matches a sector but the listing hedges on future use,
+          or evidence is present but indirect (e.g. former food store now
+          vacant with no stated future intent, or conversion potential
+          without confirmed planning)
+Low    — Minimal signal, genuine ambiguity, agent copy that could fit
+          multiple uses, or a single weak indicator with no corroboration
+
+IMPORTANT GUIDANCE ON AMBIGUOUS CASES:
+- "Suitable for a variety of alternative uses" with no sector anchor = None, Low
+- Former food store, vacant, no stated intent = Food Store, Medium
+- Former nursery with fixtures intact = Nursery, High
+- Healthcare or medical professional use = None (not one of the three sectors)
+- Pub or restaurant conversion potential only = None
+- Do not force a sector label when the evidence is genuinely ambiguous —
+  None with Low confidence is a valid and expected output for some listings
+
+OUTPUT FORMAT:
+Respond with valid JSON only. No markdown formatting, no code blocks, no preamble,
+no explanation outside the JSON object. Your entire response must be parseable JSON.
+
+{
+  "classification": "Nursery | SEN School | Food Store | None",
+  "confidence": "High | Medium | Low",
+  "reasoning": "One or two sentences citing the specific evidence that drove this decision. Reference the actual listing data, not generic statements."
+}"""
+
+    listing_text = "\n".join([
+        f"summary: {listing['summary'] or 'not provided'}",
+        f"detailedDescription: {listing['detailedDescription'] or 'not provided'}",
+        f"keyFeatures: {', '.join(listing['keyFeatures']) if listing['keyFeatures'] else 'none'}",
+        f"propertySubType: {listing['propertySubType'] or 'not provided'}",
+        f"useClass: {listing['useClass'] or 'not provided'}",
+        f"tenureType: {listing['tenureType'] or 'not provided'}",
+        f"pageTitle: {listing['pageTitle'] or 'not provided'}",
+    ])
+
+    return f"{system}\n\nLISTING DATA:\n{listing_text}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# call_llm(prompt: str, client) -> str
+# call_llm(prompt: str) -> str
 #
 #   PURPOSE: Send prompt to LLM API, return raw response text
-#   INPUT:   prompt string, initialised API client
+#   INPUT:   prompt string
 #   OUTPUT:  raw response string
 #   HANDLES:
 #     - API errors -> raise with informative message
 #     - timeout -> retry once, then raise
+
+def call_llm(prompt: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(f"LLM API call failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -143,14 +252,69 @@ def extract_signal_fields(row: pd.Series) -> dict:
 #     - Invalid category values -> default to "None"
 #     - Invalid confidence values -> default to "Low"
 
+def parse_llm_response(response_text: str) -> dict:
+    valid_categories = {"Nursery", "SEN School", "Food Store", "None"}
+    valid_confidence = {"High", "Medium", "Low"}
+
+    try:
+        # strip markdown code blocks if model wraps response
+        cleaned = response_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+
+        parsed = json.loads(cleaned)
+
+        classification = parsed.get("classification", "None")
+        confidence = parsed.get("confidence", "Low")
+        reasoning = parsed.get("reasoning", "No reasoning provided")
+
+        if classification is None or (
+            isinstance(classification, float) and pd.isna(classification)
+        ):
+            classification = "None"
+        if classification not in valid_categories:
+            classification = "None"
+        if confidence is None or (
+            isinstance(confidence, float) and pd.isna(confidence)
+        ):
+            confidence = "Low"
+        if confidence not in valid_confidence:
+            confidence = "Low"
+        if reasoning is None or (
+            isinstance(reasoning, float) and pd.isna(reasoning)
+        ):
+            reasoning = "No reasoning provided"
+
+        return {
+            "classification": str(classification),
+            "confidence": str(confidence),
+            "reasoning": str(reasoning),
+        }
+
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return {
+            "classification": "None",
+            "confidence": "Low",
+            "reasoning": "Failed to parse LLM response",
+        }
+
 # ─────────────────────────────────────────────────────────────────────────────
 
-# classify_listing(listing: dict, client) -> dict
+# classify_listing(listing: dict) -> dict
 #
 #   PURPOSE: Orchestrate single listing classification end to end
-#   INPUT:   clean signal dict, API client
+#   INPUT:   clean signal dict
 #   OUTPUT:  {id, classification, confidence, reasoning}
 #   CALLS:   build_prompt() -> call_llm() -> parse_llm_response()
+
+def classify_listing(listing: dict) -> dict:
+    prompt = build_prompt(listing)
+    raw = call_llm(prompt)
+    parsed = parse_llm_response(raw)
+    return {"id": listing["id"], **parsed}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -166,6 +330,19 @@ def extract_signal_fields(row: pd.Series) -> dict:
 #            - merged on id column
 #   HANDLES: id type mismatch (string vs float) during merge
 
+def write_results(results: list, original_df: pd.DataFrame, output_path: str):
+    results_df = pd.DataFrame(results)
+
+    # normalise id column in original for merge
+    original_df["id"] = original_df["id"].apply(normalise_id)
+
+    merged = original_df.merge(results_df, on="id", how="left")
+    merged["classification"] = merged["classification"].fillna("None")
+    merged["confidence"] = merged["confidence"].fillna("Low")
+    merged["reasoning"] = merged["reasoning"].fillna("Insufficient data to classify")
+    merged.to_csv(output_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+    print(f"Results written to {output_path}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # main()
@@ -175,21 +352,39 @@ def extract_signal_fields(row: pd.Series) -> dict:
 #     1. load_csv(INPUT_PATH) -> raw_df
 #     2. for each row in raw_df:
 #            listing = extract_signal_fields(row)
-#            result  = classify_listing(listing, client)
+#            result  = classify_listing(listing)
 #            append result to results list
 #     3. write_results(results, raw_df, OUTPUT_PATH)
 #     4. print summary: N classified, breakdown by category
 
 def main():
     df = load_csv(INPUT_PATH)
-    listings = []
-    for _, row in df.iterrows():
-        listing = extract_signal_fields(row)
-        listings.append(listing)
-        print(f"ID: {listing['id']} | summary: {listing['summary'][:80]}")
+    listings = [extract_signal_fields(row) for _, row in df.iterrows()]
 
-    print(f"\nExtracted {len(listings)} listings")
-    return listings
+    results = []
+    for listing in listings:
+        print(f"Classifying {listing['id']}...")
+        result = classify_listing(listing)
+        results.append(result)
+        print(f"  -> {result['classification']} ({result['confidence']})")
+
+    write_results(results, df, OUTPUT_PATH)
+
+    # print summary from in-memory results
+    from collections import Counter
+    counts = Counter(r["classification"] for r in results)
+    print("\nSummary:")
+    for category, count in counts.items():
+        print(f"  {category}: {count}")
+
+    # verify CSV round-trip (pandas treats bare "None" as NA unless disabled)
+    verify_df = pd.read_csv(OUTPUT_PATH, keep_default_na=False)
+    csv_counts = verify_df["classification"].value_counts()
+    print("\nVerified CSV value_counts:")
+    for category, count in csv_counts.items():
+        print(f"  {category}: {count}")
+    print(f"  Total: {len(verify_df)}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
